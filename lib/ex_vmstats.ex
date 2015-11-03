@@ -1,7 +1,7 @@
 defmodule ExVmstats do
   use GenServer
 
-  defstruct [:backend, :use_histogram, :interval, :timer_ref, :namespace, :prev_io, :prev_gc]
+  defstruct [:backend, :use_histogram, :interval, :sched_time, :prev_sched, :timer_ref, :namespace, :prev_io, :prev_gc]
 
   @timer_msg :interval_elapsed
 
@@ -14,6 +14,17 @@ defmodule ExVmstats do
     namespace = Application.get_env(:ex_vmstats, :namespace, "vm_stats")
     use_histogram = Application.get_env(:ex_vmstats, :use_histogram, false)
 
+    sched_time =
+      case {sched_time_available?, Application.get_env(:ex_vmstats, :sched_time, false)} do
+        {true, true} -> :enabled
+        {true, _} -> :disabled
+        {false, _} -> :unavailable
+      end
+
+    prev_sched =
+      :erlang.statistics(:scheduler_wall_time)
+      |> Enum.sort
+
     backend = 
       Application.get_env(:ex_vmstats, :backend, :ex_statsd)
       |> get_backend
@@ -24,6 +35,8 @@ defmodule ExVmstats do
       backend: backend,
       use_histogram: use_histogram,
       interval: interval,
+      sched_time: sched_time,
+      prev_sched: prev_sched,
       timer_ref: :erlang.start_timer(interval, self, @timer_msg),
       namespace: namespace,
       prev_io: {input, output},
@@ -93,9 +106,27 @@ defmodule ExVmstats do
 
     backend.counter(reds, metric_name.("reductions"))
 
+    #Scheduler wall time
+    sched =
+      case state.sched_time do
+        :enabled ->
+          new_sched = Enum.sort(:erlang.statistics(:scheduler_wall_time))
+
+          for {sid, active, total} <- wall_time_diff(state.prev_sched, new_sched) do
+            scheduler_metric_base = "#{namespace}.scheduler_wall_time.#{sid}"
+
+            backend.timing(active, scheduler_metric_base <> ".active")
+            backend.timing(total, scheduler_metric_base <> ".total")
+          end
+
+          new_sched
+        _ ->
+          nil
+      end
+
     timer_ref = :erlang.start_timer(interval, self, @timer_msg)
 
-    {:noreply, %{state | timer_ref: timer_ref, prev_io: {input, output}, prev_gc: gc}}
+    {:noreply, %{state | timer_ref: timer_ref, prev_sched: sched, prev_io: {input, output}, prev_gc: gc}}
   end
 
   defp metric(namespace, metric) do
@@ -113,4 +144,20 @@ defmodule ExVmstats do
 
   defp get_backend(:ex_statsd), do: ExVmstats.Backends.ExStatsD
   defp get_backend(backend), do: backend
+
+  defp sched_time_available? do
+    try do
+      :erlang.system_flag(:scheduler_wall_time, true)
+    catch
+      _ -> true
+    rescue
+      ArgumentError -> false
+    end
+  end
+
+  defp wall_time_diff(prev_sched, new_sched) do
+    for {{i, prev_active, prev_total}, {i, new_active, new_total}} <- Enum.zip(prev_sched, new_sched) do
+      {i, new_active - prev_active, new_total - prev_total}
+    end
+  end
 end

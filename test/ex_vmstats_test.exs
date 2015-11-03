@@ -78,6 +78,19 @@ defmodule ExVmstatsTest do
     Application.put_env(:ex_vmstats, :use_histogram, false)
   end
 
+  test "sched_time enabled" do
+    Application.put_env(:ex_vmstats, :sched_time, true)
+
+    capture = capture_log fn ->
+      run_and_terminate_server(600)
+    end
+
+    assert match_count(~r/timing/, capture) == 16
+    assert match_count(~r/scheduler_wall_time.\d(.active|.total)/, capture) == 16
+
+    Application.put_env(:ex_vmstats, :sched_time, false)
+  end
+
   defp match_count(regex, string) do
     Regex.scan(regex, string)
     |> length
